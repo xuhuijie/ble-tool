@@ -2,10 +2,9 @@
  * 设备筛选器 —— 本工具的核心能力模块
  *
  * 三个筛选维度，全部决策统一收口到 DeviceFilter：
- *   1. 蓝牙名称筛选（keyword）
- *      - 系统选择框模式：受 API 限制只能用 namePrefix 前缀匹配
- *        （requestDevice 的 filters 只支持 name/namePrefix）
- *      - 极简列表模式：客户端「包含」匹配（matchesName），更灵活
+ *   1. 蓝牙名称筛选（keyword，大小写不敏感）
+ *      - 系统选择框层：关键字展开为[原样/小写/大写]前缀变体做 OR 预过滤，
+ *        兼顾大小写不敏感与原生隐藏无名设备；选中后由 matches() 做最终校验
  *   2. 未知设备筛选（namedOnly）
  *      - 一键排除无名称设备；系统选择框无法预先隐藏它们，
  *        选中后由 matches() 兜底校验并拒绝
@@ -14,9 +13,8 @@
  *
  * 使用方式：
  *   const filter = DeviceFilter.fromUserInput({ name, serviceText, namedOnly });
- *   filter.matches(device)          // 客户端判定（极简列表/选中校验）
+ *   filter.matches(device)          // 客户端判定（选中校验）
  *   filter.toRequestOptions()       // 生成 requestDevice 参数
- *   filter.toScanOptions()          // 生成 requestLEScan 参数
  *   filter.describe()               // 日志友好的条件描述
  * ============================================================ */
 'use strict';
@@ -114,7 +112,7 @@ export class DeviceFilter {
     return typeof device?.name === 'string' && device.name.length > 0;
   }
 
-  /** 名称「包含」匹配（客户端判定，大小写不敏感；极简列表和选中校验用） */
+  /** 名称「包含」匹配（客户端判定，大小写不敏感；选中校验用） */
   matchesName(name) {
     if (!this.keyword) return true;
     return typeof name === 'string' && name.toLowerCase().includes(this.keyword.toLowerCase());
@@ -133,32 +131,28 @@ export class DeviceFilter {
 
   /**
    * 生成 requestDevice 参数（系统选择框模式）。
-   * 注意：名称在 API 层只能做前缀匹配（namePrefix）；无名称设备无法在
-   * 选择框里预先隐藏，需要选中后用 matches() 兜底校验。
+   * 大小写不敏感搜索：浏览器原生的 namePrefix 是大小写敏感的，这里把关键字展开为
+   * [原样/小写/大写] 三种前缀变体做 OR 过滤，覆盖常见命名（NWM/nwm），同时保留原生
+   * 过滤无名设备的能力；选中后再由 matches() 做最终的大小写不敏感「包含」校验。
    */
   toRequestOptions() {
-    const filter = {};
-    if (this.keyword) filter.namePrefix = this.keyword;
-    if (this.services.length) filter.services = [...this.services];
     const opts = { optionalServices: buildOptionalServices(this.services.join(',')) };
-    if (Object.keys(filter).length) {
+    const variants = this.keyword
+      ? [...new Set([this.keyword, this.keyword.toLowerCase(), this.keyword.toUpperCase()])]
+      : [null];
+    const filters = variants.map((v) => {
+      const f = {};
+      if (v) f.namePrefix = v;
+      if (this.services.length) f.services = [...this.services];
+      return f;
+    }).filter((f) => Object.keys(f).length);
+    if (filters.length) {
       opts.acceptAllDevices = false;
-      opts.filters = [filter];
+      opts.filters = filters;
     } else {
       opts.acceptAllDevices = true;
     }
     return opts;
-  }
-
-  /**
-   * 生成 requestLEScan 参数（极简列表模式）。
-   * 名称和已知设备条件交给客户端 matches() 处理（API 只支持前缀匹配，
-   * 客户端可做「包含」匹配，且能对无名称设备做统一拦截）；
-   * 服务条件仍在 API 层过滤（省流量且语义一致）。
-   */
-  toScanOptions() {
-    if (this.services.length) return { filters: [{ services: [...this.services] }] };
-    return { acceptAllAdvertisements: true };
   }
 
   /** 日志友好的条件描述 */

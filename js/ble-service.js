@@ -2,8 +2,8 @@
  * 蓝牙服务层：所有 navigator.bluetooth 调用集中于此
  *
  * 职责：
- *   - 扫描：系统选择框（requestDevice）+ 极简列表（requestLEScan 实验 API）
- *   - 连接生命周期：连接 / 断开 / 意外断开回调 / 设备授权补登
+ *   - 扫描：系统选择框（requestDevice）
+ *   - 连接生命周期：连接 / 断开 / 意外断开回调
  *   - GATT 操作：服务发现 / 读 / 写 / 订阅通知 / 定时读
  *
  * 与 UI 解耦：通过构造时注入的 hooks 回调向外通知
@@ -14,7 +14,7 @@
  * ============================================================ */
 'use strict';
 
-import { buildOptionalServices } from './device-filter.js';
+import { buildOptionalServices, DeviceFilter } from './device-filter.js';
 import { serviceName, characteristicName } from './names.js';
 
 export class BleService {
@@ -26,9 +26,6 @@ export class BleService {
     this.subscribed = new Set(); // 已订阅通知的特征 UUID
     this.pollTimer = null;
     this.pollTarget = null;
-    this._scan = null;           // 当前 LE 扫描句柄
-    this._scanHandler = null;    // advertisementreceived 监听器
-    this._advUuids = new Set();  // 扫描中收集的广播服务 UUID（授权用）
     this._boundChars = new WeakSet(); // 已绑定通知处理器的特征对象（防重复绑定）
     this._onDisconnected = (e) => this._handleDisconnected(e);
   }
@@ -47,59 +44,12 @@ export class BleService {
    */
   async requestSystemDevice(filter) {
     const dev = await navigator.bluetooth.requestDevice(filter.toRequestOptions());
-    // 兜底校验：系统选择框无法预先隐藏无名称设备，选中后由筛选器统一拦截
+    // 兜底校验：名称关键字（大小写不敏感）+ 未知设备筛选，选中后统一拦截
     if (!filter.matches(dev)) {
-      return { ok: false, rejected: true };
+      const reason = filter.namedOnly && !DeviceFilter.hasName(dev) ? 'unnamed' : 'keyword';
+      return { ok: false, rejected: true, reason, name: dev?.name || '', keyword: filter.keyword };
     }
     return { ok: true, device: dev };
-  }
-
-  /**
-   * 极简列表模式：requestLEScan（需 chrome://flags 开实验开关）。
-   * 每条匹配的广播触发 onDevice(device, event)；匹配判定统一走 filter.matches()。
-   * @returns {Promise<{ok:boolean, reason?:string}>} reason='unsupported' 表示浏览器不支持
-   */
-  async startMiniScan(filter, onDevice) {
-    if (!navigator.bluetooth.requestLEScan) return { ok: false, reason: 'unsupported' };
-    this._advUuids.clear();
-    this._scanHandler = (e) => {
-      // 从广播包收集服务 UUID（e.serviceData 的键 / e.uuids），连接授权时自动声明
-      if (e.serviceData) Object.keys(e.serviceData).forEach((u) => this._advUuids.add(u));
-      if (Array.isArray(e.uuids)) e.uuids.forEach((u) => this._advUuids.add(u));
-      if (filter.matches(e.device)) onDevice(e.device, e);
-    };
-    this._scan = await navigator.bluetooth.requestLEScan(filter.toScanOptions());
-    navigator.bluetooth.addEventListener('advertisementreceived', this._scanHandler);
-    return { ok: true };
-  }
-
-  /** 停止 LE 扫描并解绑监听（幂等，可安全重复调用） */
-  stopScan() {
-    if (this._scanHandler) {
-      navigator.bluetooth.removeEventListener('advertisementreceived', this._scanHandler);
-      this._scanHandler = null;
-    }
-    if (this._scan) {
-      try { this._scan.stop(); } catch {}
-      this._scan = null;
-    }
-  }
-
-  /**
-   * 为 LE 扫描到的设备补一次授权：requestDevice 借系统选择框完成
-   * （带设备名精确匹配 + 广播包收集到的服务授权）。必须在点击链内调用。
-   */
-  async requestAuthorization(dev) {
-    const opts = { acceptAllDevices: true };
-    const filter = {};
-    if (dev.name && dev.name !== '(未命名)') filter.name = dev.name;
-    if (Object.keys(filter).length) {
-      opts.acceptAllDevices = false;
-      opts.filters = [filter];
-    }
-    // 带广播包收集到的服务 + 常用服务授权，否则服务枚举会被拒绝
-    opts.optionalServices = buildOptionalServices(Array.from(this._advUuids).join(','));
-    return navigator.bluetooth.requestDevice(opts);
   }
 
   /* ============ 连接生命周期 ============ */

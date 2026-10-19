@@ -6,12 +6,36 @@
   <meta name="theme-color" content="#0b1020">
   <meta name="description" content="BLE 蓝牙调试助手 - 手机网页版，基于 Web Bluetooth，支持服务浏览、读写、通知、协议解析。">
   <title>BLE 蓝牙调试助手</title>
-  <link rel="stylesheet" href="css/style.css?v=20260829c">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232563eb'/%3E%3Ctext x='32' y='45' font-size='34' text-anchor='middle' fill='white'%3E%E2%9A%A1%3C/text%3E%3C/svg%3E">
+  <script>try{document.documentElement.dataset.theme=localStorage.getItem('ble_theme')||'dark';}catch(e){}</script>
+  <link rel="stylesheet" href="css/style.css?v=20261019w">
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
 </head>
 <body>
+
+  <!-- 登录门禁 -->
+  <div id="loginGate" class="login-gate hidden">
+    <div class="login-card card">
+      <div class="card-head"><h2 id="loginTitle">登录</h2>
+        <button class="btn ghost small theme-btn" title="切换深色/浅色主题">☀️</button>
+      </div>
+      <div id="loginForm">
+        <label class="mini">用户名<input id="loginUser" class="text" autocomplete="username"></label>
+        <label class="mini">密码<input id="loginPw" type="password" class="text" autocomplete="current-password"></label>
+        <button id="btnLogin" class="btn primary block">登录</button>
+        <p class="hint" id="loginHint"></p>
+      </div>
+      <div id="setupForm" class="hidden">
+        <p class="hint">首次使用，请创建一个管理员账号。</p>
+        <label class="mini">用户名<input id="setupUser" class="text" autocomplete="username"></label>
+        <label class="mini">密码<input id="setupPw" type="password" class="text" autocomplete="new-password"></label>
+        <label class="mini">确认密码<input id="setupPw2" type="password" class="text" autocomplete="new-password"></label>
+        <button id="btnSetup" class="btn primary block">创建管理员并登录</button>
+      </div>
+    </div>
+  </div>
 
   <!-- 顶部应用栏 -->
   <header class="appbar">
@@ -20,7 +44,14 @@
         <span class="brand-dot"></span>
         <h1>BLE 调试助手</h1>
       </div>
-      <span id="connPill" class="pill">未连接</span>
+      <span class="appbar-right">
+        <span id="connPill" class="pill">未连接</span>
+        <button id="btnTheme" class="btn ghost small theme-btn" title="切换深色/浅色主题">☀️</button>
+        <span id="userBox" class="hidden">
+          <span id="userBadge" class="pill"></span>
+          <button id="btnLogout" class="btn ghost small">退出</button>
+        </span>
+      </span>
     </div>
 
     <div class="appbar-status" id="deviceStatusBar">
@@ -51,18 +82,10 @@
       </div>
       <label class="chk chk-scan"><input type="checkbox" id="ckNamed" checked> 只看有名称的设备（选中无名称的设备会自动过滤）</label>
       <p class="hint dim" style="font-size:11.5px;margin:2px 0 4px;line-height:1.5">
-        说明：系统列表是浏览器原生选择框，会把附近所有蓝牙（含无名称的）都显示出来，网页无法隐藏它们。
-        想完全隐藏未知设备：在浏览器地址栏输入 <b>edge://flags/#enable-experimental-web-platform-features</b>
-        （Chrome 则输入 <b>chrome://flags/…</b>）→ 选 Enabled → 重启浏览器，再切到「极简列表」模式搜索。
+        说明：系统列表是浏览器原生选择框，会把附近所有蓝牙（含无名称的）都显示出来，网页无法隐藏它们。用「设备名称包含」可过滤。
       </p>
-      <div class="seg" id="searchMode">
-        <button class="seg-btn active" data-mode="system">系统列表</button>
-        <button class="seg-btn" data-mode="mini">极简列表</button>
-      </div>
       <button id="btnScan" class="btn primary block">搜索设备</button>
-      <p class="hint">「系统列表」用浏览器自带选择框（Android 手机 Chrome/Edge 用它）；「极简列表」在页面上自己渲染设备列表，只显示匹配名称的设备，不展示任何未知设备（需 Chrome/Edge 桌面版开启实验开关，手机暂不支持）。连不上、或读不出 GATT 服务的设备会被自动过滤。</p>
-
-      <div id="miniList" class="mini-list hidden"></div>
+      <p class="hint">连不上、或读不出 GATT 服务的设备会被自动过滤。</p>
 
       <div id="selectedCard" class="selected-card hidden">
         <div class="select-info">
@@ -112,7 +135,10 @@
     <nav id="tabs" class="tabs hidden">
       <button data-tab="gatt" class="tab active">服务</button>
       <button data-tab="uart" class="tab">透传</button>
+      <button data-tab="modbus" class="tab">Modbus</button>
+      <button data-tab="mbdev" class="tab">设备</button>
       <button data-tab="proto" class="tab">协议</button>
+      <button data-tab="mbuser" class="tab hidden" id="tabBtnUser">用户</button>
     </nav>
 
     <!-- 服务与特征 -->
@@ -156,7 +182,7 @@
           <label class="mini">RX 特征<input id="uartRxChar" class="text mono" placeholder="特征UUID"></label>
         </div>
         <button id="btnSaveUart" class="btn ghost small">保存配置</button>
-        <p class="hint">留空则自动选择首个可写特征发送；RX 特征需支持 notify/indicate 才能接收。</p>
+        <p class="hint">配置与「设备」页当前选中的设备绑定，保存后写入云端；切换设备时自动套用该设备的透传配置。留空则自动选择首个可写特征发送；RX 特征需支持 notify/indicate 才能接收。</p>
       </div>
 
       <div class="card">
@@ -177,6 +203,146 @@
           <label class="chk"><input type="checkbox" id="ckTime" checked> 时间戳</label>
           <label class="chk"><input type="checkbox" id="ckScroll" checked> 自动滚动</label>
         </div>
+      </div>
+    </section>
+
+    <!-- Modbus RTU -->
+    <section id="tab-modbus" class="tab-body">
+      <div class="card">
+        <div class="card-head"><h2>Modbus RTU</h2></div>
+        <div class="row">
+          <label class="mini">设备地址<input id="mbAddr" class="text mono" value="1" placeholder="1~247"></label>
+          <label class="mini">功能码<select id="mbFunc" class="text">
+            <option value="3">03 读保持寄存器</option>
+            <option value="4">04 读输入寄存器</option>
+            <option value="6">06 写单个寄存器</option>
+            <option value="16">10 写多个寄存器</option>
+          </select></label>
+        </div>
+        <div class="row">
+          <label class="mini">起始地址<input id="mbStart" class="text mono" placeholder="0"></label>
+          <label class="mini" id="mbCountWrap">数量<input id="mbCount" class="text mono" placeholder="1"></label>
+          <label class="mini hidden" id="mbValueWrap">写入值<input id="mbValue" class="text mono" placeholder="0~65535"></label>
+        </div>
+        <div class="row">
+          <label class="mini" id="mbFmtWrap">解析<select id="mbFmt" class="text">
+            <option value="u16">16位寄存器</option>
+            <option value="i32">32位整型 LONG</option>
+            <option value="f32">32位浮点 FLOAT</option>
+          </select></label>
+          <label class="mini hidden" id="mbOrderWrap">字序<select id="mbOrder" class="text">
+            <option value="ABCD">大端 ABCD</option>
+            <option value="CDAB">小端 CDAB</option>
+          </select></label>
+        </div>
+        <div class="row between">
+          <button id="btnMbSend" class="btn primary">发送</button>
+        </div>
+        <p class="hint">复用透传页的 TX/RX 配置收发；地址支持十进制或 0x 十六进制。寄存器地址为协议地址（0-based），40001 对应填 0。CRC 自动计算，响应自动校验并解析。</p>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>结果</h2><button id="btnMbClear" class="btn ghost small">清空</button></div>
+        <div id="mbResult" class="log mono"></div>
+      </div>
+    </section>
+
+    <!-- Modbus 设备配置 -->
+    <section id="tab-mbdev" class="tab-body">
+      <div class="card">
+        <div class="card-head"><h2>设备</h2>
+          <span class="right">
+            <button id="btnMbdAdd" class="btn ghost small">＋ 新增</button>
+            <button id="btnMbdEdit" class="btn ghost small">编辑</button>
+            <button id="btnMbdDel" class="btn ghost small">删除</button>
+          </span>
+        </div>
+        <div class="row">
+          <select id="mbdSel" class="text flex1"></select>
+        </div>
+        <p class="hint" id="mbdConnHint"></p>
+        <div id="mbdForm" class="hidden">
+          <div class="card-head"><h2 id="mbdFormTitle">新增设备</h2></div>
+          <div class="row">
+            <label class="mini">设备名称<input id="mbdName" class="text" placeholder="如 1号电表"></label>
+            <label class="mini">从站地址<input id="mbdSlave" class="text mono" value="1" placeholder="1~247"></label>
+          </div>
+          <div class="row">
+            <label class="mini">蓝牙名称<input id="mbdBle" class="text" placeholder="可选，用于核对连接"></label>
+            <label class="mini">字序<select id="mbdWordOrder" class="text">
+              <option value="ABCD">大端 ABCD</option>
+              <option value="CDAB">小端 CDAB</option>
+            </select></label>
+          </div>
+          <div class="row">
+            <label class="mini">TX 服务 UUID<input id="mbdTxSvc" class="text mono" placeholder="透传发送服务"></label>
+            <label class="mini">TX 特征 UUID<input id="mbdTxChar" class="text mono" placeholder="透传发送特征"></label>
+          </div>
+          <div class="row">
+            <label class="mini">RX 服务 UUID<input id="mbdRxSvc" class="text mono" placeholder="透传接收服务"></label>
+            <label class="mini">RX 特征 UUID<input id="mbdRxChar" class="text mono" placeholder="透传接收特征"></label>
+          </div>
+          <div class="row">
+            <button id="btnMbdSave" class="btn primary small">保存</button>
+            <button id="btnMbdCancel" class="btn ghost small">取消</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>寄存器配置</h2>
+          <span class="right">
+            <button id="btnMbrReadAll" class="btn primary small">读取全部</button>
+            <button id="btnMbrAdd" class="btn ghost small">＋ 添加寄存器</button>
+          </span>
+        </div>
+        <div id="mbrForm" class="hidden">
+          <div class="card-head"><h2 id="mbrFormTitle">添加寄存器</h2></div>
+          <div class="row">
+            <label class="mini">变量名<input id="mbrName" class="text" placeholder="如 正向总电量"></label>
+            <label class="mini">寄存器地址<input id="mbrAddr" class="text mono" placeholder="0"></label>
+          </div>
+          <div class="row">
+            <label class="mini">寄存器类型<select id="mbrRegType" class="text">
+              <option value="readwrite">读写</option>
+              <option value="readonly">只读</option>
+              <option value="writeonly">只写</option>
+            </select></label>
+            <label class="mini">数据类型<select id="mbrDataType" class="text">
+              <option value="uint16">UINT16</option>
+              <option value="int16">INT16</option>
+              <option value="uint32">UINT32</option>
+              <option value="int32">INT32</option>
+              <option value="float32">FLOAT32</option>
+              <option value="enum">选择</option>
+            </select></label>
+          </div>
+          <div class="row hidden" id="mbrOptionsWrap">
+            <div style="flex:1;min-width:240px">
+              <div class="mini" style="margin-bottom:6px">写入选项（写入值 → 操作名称）</div>
+              <div id="mbrOptList" style="display:flex;flex-direction:column;gap:6px;margin-bottom:6px"></div>
+              <button id="btnMbrOptAdd" type="button" class="btn ghost small">＋ 添加写入选项</button>
+            </div>
+          </div>
+          <div class="row hidden" id="mbrReadOptionsWrap">
+            <div style="flex:1;min-width:240px">
+              <div class="mini" style="margin-bottom:6px">读取选项（读取值 → 显示名称，不填则用写入选项）</div>
+              <div id="mbrReadOptList" style="display:flex;flex-direction:column;gap:6px;margin-bottom:6px"></div>
+              <button id="btnMbrReadOptAdd" type="button" class="btn ghost small">＋ 添加读取选项</button>
+            </div>
+          </div>
+          <div class="row">
+            <label class="mini">单位<input id="mbrUnit" class="text" placeholder="如 kWh"></label>
+            <label class="mini">缩放系数<input id="mbrScale" class="text mono" value="1"></label>
+            <label class="mini">偏移量<input id="mbrOffset" class="text mono" value="0"></label>
+          </div>
+          <div class="row">
+            <button id="btnMbrSave" class="btn primary small">保存</button>
+            <button id="btnMbrCancel" class="btn ghost small">取消</button>
+          </div>
+          <p class="hint">显示值 = 原始值 × 缩放系数 ＋ 偏移量；写入时自动逆算。32 位类型占用 2 个寄存器。</p>
+        </div>
+        <div id="mbrList" class="reg-grid"></div>
       </div>
     </section>
 
@@ -218,10 +384,31 @@
 
     <!-- 日志页签已移至连接卡片下方常驻显示 -->
 
+    <!-- 用户管理（仅管理员） -->
+    <section id="tab-mbuser" class="tab-body">
+      <div class="card">
+        <div class="card-head"><h2>用户管理</h2></div>
+        <div id="userList" class="rule-table"></div>
+        <p class="hint">管理员可修改设备与寄存器配置；普通用户只能连接蓝牙、使用设备页读写，不能改配置。至少保留一个管理员。</p>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>新增用户</h2></div>
+        <div class="row">
+          <label class="mini">用户名<input id="nuName" class="text" autocomplete="off"></label>
+          <label class="mini">密码<input id="nuPw" type="password" class="text" autocomplete="new-password"></label>
+          <label class="mini">角色<select id="nuRole" class="text">
+            <option value="user">普通用户</option>
+            <option value="admin">管理员</option>
+          </select></label>
+        </div>
+        <button id="btnNuAdd" class="btn primary small">添加用户</button>
+      </div>
+    </section>
+
   </main>
 
   <div id="toast" class="toast hidden"></div>
 
-  <script type="module" src="js/main.js?v=20260829c"></script>
+  <script type="module" src="js/main.js?v=20261019w"></script>
 </body>
 </html>

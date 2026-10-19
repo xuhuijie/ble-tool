@@ -7,7 +7,9 @@
 export const KEYS = {
   UART: 'ble_uart',            // UART 透传配置
   PROTOCOLS: 'ble_protocols', // 协议解析规则
-  SEARCH_MODE: 'ble_search_mode', // 搜索模式 system/mini
+  MODBUS: 'ble_modbus',          // Modbus RTU 配置（设备地址等）
+  MBDEVICES: 'ble_mb_devices',   // Modbus 设备/寄存器配置表
+  USERS: 'ble_users',            // 本地用户（管理员/普通用户）
 };
 
 export function loadJson(key, fallback) {

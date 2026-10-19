@@ -5,26 +5,30 @@
 'use strict';
 
 import { DeviceFilter } from './device-filter.js';
+import { ApiClient } from './api.js';
 import { BleService } from './ble-service.js';
 import { UartPanel } from './uart-panel.js';
 import { ProtocolPanel } from './protocol-panel.js';
+import { ModbusPanel } from './modbus-panel.js';
+import { MbStore } from './mb-store.js';
+import { MbDevicePanel } from './mb-device-panel.js';
+import { MbAuth } from './mb-auth.js';
+import { MbUserPanel } from './mb-user-panel.js';
 import { encodeAuto, formatData } from './codec.js';
 import { charLabel } from './names.js';
-import { KEYS, loadText, saveText } from './storage.js';
+
 import {
   $, esc, toast, appendLog, appendGatt, setPill, setConnUI, detectSupport,
   renderSvcTree, renderAdvertisement, setCharValue, resetPollButtons,
   formatForView, exportLog, setLogFilter, setDisplayOptions,
 } from './ui.js';
 
-const VERSION = 'v20260829-c';
+const VERSION = 'v20261019-w';
 const SCAN_TIMEOUT_MS = 8000;
 
 /* ---------- 页面状态 ---------- */
-let searchMode = 'system';   // system=系统选择框 / mini=极简列表（实验扫描）
 let pendingDevice = null;    // 搜索选中、尚未连接的设备
 let lastKeyword = '';         // 上次搜索用的名称关键字（重连用）
-let scanTimer = null;        // 极简列表扫描超时句柄
 let sendMode = 'text';       // 发送编码模式（镜像 UartPanel 状态）
 
 /* ---------- 模块实例 ---------- */
@@ -36,6 +40,12 @@ const ble = new BleService({
 });
 const uartPanel = new UartPanel(ble);
 const protocolPanel = new ProtocolPanel();
+const modbusPanel = new ModbusPanel(ble, uartPanel);
+const api = new ApiClient();
+const mbStore = new MbStore(api);
+const mbDevicePanel = new MbDevicePanel(ble, modbusPanel, mbStore, uartPanel);
+const auth = new MbAuth(api);
+const userPanel = new MbUserPanel(auth);
 
 /* ============================================================
  * 特征值统一路由：读 / 通知数据都从这里分发
@@ -47,15 +57,24 @@ function handleValue(uuid, u8, source) {
   appendGatt(`${label} ${charLabel(uuid)}: ${formatData(u8)}`, '#4ade80');
   protocolPanel.onData(uuid, u8, source);
   uartPanel.routeValue(uuid, u8);
+  modbusPanel.onRx(uuid, u8, source);
 }
 
 /* ============================================================
- * 搜索流程（两种模式共用 DeviceFilter）
+ * 搜索流程
  * ============================================================ */
 async function searchDevice() {
+  // 防重入：系统授权框未关闭时再次点击会把旧请求顶掉，
+  // 旧 promise 以 "User canceled the permission prompt" 被拒
+  if (searchDevice._busy) {
+    toast('正在等待蓝牙授权，请先处理弹出的授权框', true);
+    return;
+  }
+  searchDevice._busy = true;
+  try {
   appendLog('sys', '点击搜索：开始查找设备…');
   // 防旧缓存混合页面：关键 DOM 缺失时明确报错，而不是静默崩掉
-  if (!$('searchMode') || !$('fName') || !$('fService') || !$('ckNamed')) {
+  if (!$('fName') || !$('fService') || !$('ckNamed')) {
     appendLog('err', '发现页面结构不完整（很可能加载了旧缓存）。请点击浏览器刷新按钮，或清除缓存后重开本页。');
     toast('页面是旧缓存，请刷新后再试', true);
     setPill('', '未连接');
@@ -75,8 +94,10 @@ async function searchDevice() {
   }
   lastKeyword = filter.keyword;
 
-  if (searchMode === 'mini') return scanMini(filter);
-  return searchSystem(filter);
+  return await searchSystem(filter);
+  } finally {
+    searchDevice._busy = false;
+  }
 }
 
 /* ---- 系统选择框模式 ---- */
@@ -84,13 +105,18 @@ async function searchSystem(filter) {
   appendLog('sys', `当前模式：系统列表（${filter.describe()}）`);
   setPill('connecting', '搜索中…');
   try {
-    const { ok, device, rejected } = await ble.requestSystemDevice(filter);
+    const { ok, device, rejected, reason, name, keyword } = await ble.requestSystemDevice(filter);
     if (rejected) {
-      // 兜底拦截：选中的设备没过筛选（典型：无名称 + 只看已知设备）
+      // 兜底拦截：选中的设备没过筛选
       $('selectedCard').classList.add('hidden');
       setPill('', '未连接');
-      toast('该设备未命名，已按「只看已知设备」过滤', true);
-      appendLog('sys', '所选设备没有名称，被「只看已知设备」过滤。如需连接，请取消勾选后再搜索。');
+      if (reason === 'keyword') {
+        toast(`名称不包含「${keyword}」（已忽略大小写）`, true);
+        appendLog('sys', `所选设备「${name || '(未命名)'}」名称不包含关键字「${keyword}」（大小写不敏感），请重新选择。`);
+      } else {
+        toast('该设备未命名，已按「只看已知设备」过滤', true);
+        appendLog('sys', '所选设备没有名称，被「只看已知设备」过滤。如需连接，请取消勾选后再搜索。');
+      }
       return;
     }
     pendingDevice = device;
@@ -112,94 +138,8 @@ async function searchSystem(filter) {
   }
 }
 
-/* ---- 极简列表模式（requestLEScan 实验 API） ---- */
-async function scanMini(filter) {
-  const list = $('miniList');
-  let found = 0;
-  const seen = new Set();
-
-  // 每条匹配广告渲染一行（去重靠 seen；匹配判定在 BleService 内统一走 filter.matches）
-  const onAdvertisement = (device, event) => {
-    if (seen.has(device.id)) return;
-    seen.add(device.id);
-    found++;
-    const name = device.name || '(未命名)';
-    const row = document.createElement('div');
-    row.className = 'mini-item';
-    row.innerHTML =
-      `<span class="mini-name">${esc(name)}</span>` +
-      `<span class="mini-meta">${esc(device.id.slice(0, 8))} · ${event.rssi} dBm</span>`;
-    row.addEventListener('click', () => {
-      clearTimeout(scanTimer);
-      ble.stopScan();
-      connectMiniDevice(device);
-    });
-    list.insertBefore(row, list.firstChild);
-  };
-
-  try {
-    const res = await ble.startMiniScan(filter, onAdvertisement);
-    if (!res.ok) {
-      // 浏览器未开实验开关：切回系统模式并明确引导（不能链式代发搜索，
-      // requestDevice 必须由真实用户手势触发，代发不弹框也不报错）
-      searchMode = 'system';
-      syncSearchModeUI();
-      saveSearchMode();
-      list.classList.add('hidden');
-      setPill('', '未连接');
-      toast('已切回系统列表，请再次点击「搜索设备」', true);
-      appendLog('err', '本浏览器未启用实验扫描接口（requestLEScan），已自动切回「系统列表」模式。');
-      appendLog('err', '如需用极简列表隐藏未知设备：地址栏输入 edge://flags/#enable-experimental-web-platform-features（Chrome 用 chrome://flags/#enable-…）→ 选 Enabled → 重启浏览器 → 再切「极简列表」。');
-      appendLog('sys', '提示：在「设备名称包含」填入关键字（如 JNB），系统选择框也只会显示匹配的设备，可同样过滤未知设备。');
-      appendLog('sys', '已切回系统列表模式，请再次点击「搜索设备」按钮打开系统选择框。');
-      return;
-    }
-
-    list.classList.remove('hidden');
-    list.innerHTML = '<div class="mini-item dim">正在扫描（仅显示匹配设备）…</div>';
-    setPill('connecting', '扫描中…');
-    appendLog('sys', `当前模式：极简列表（${filter.describe()}）`);
-
-    clearTimeout(scanTimer);
-    scanTimer = setTimeout(() => {
-      ble.stopScan();
-      setPill('', found ? '扫描完成' : '未连接');
-      if (!found) list.innerHTML = '<div class="mini-item dim">未找到匹配设备，请确认设备已开机且在附近，再次搜索</div>';
-    }, SCAN_TIMEOUT_MS);
-  } catch (err) {
-    setPill('', '未连接');
-    appendLog('err', '极简列表扫描失败：' + (err.message || err.name));
-    if (/flag|Permission|NotAllowed|scan/i.test(err.name + err.message)) {
-      list.innerHTML = '<div class="mini-item dim">实验扫描不可用：Chrome/Edge 需打开 chrome://flags/#enable-experimental-web-platform-features 并重启，或改回「系统列表」模式</div>';
-    } else {
-      list.innerHTML = `<div class="mini-item dim">扫描失败：${esc(err.message)}</div>`;
-    }
-  }
-}
-
-/* ---- 极简列表设备的连接（含授权补登） ---- */
-async function connectMiniDevice(dev) {
-  setPill('connecting', '连接中…');
-  try {
-    let target = dev;
-    // 扫描到的设备可能还没有访问权限：先尝试直接连接，无权限则借系统框补一次授权
-    try {
-      await target.gatt.connect();
-      await target.gatt.disconnect();
-    } catch (e) {
-      if (e.name !== 'NotAllowedError' && e.name !== 'SecurityError') throw e;
-      target = await ble.requestAuthorization(dev);
-    }
-    await establishConnection(target);
-  } catch (err) {
-    setPill('', '未连接');
-    appendLog('err', '连接失败：' + (err.message || err.name));
-    toast('连接失败，已过滤', true);
-  }
-}
-
 /* ============================================================
- * 连接流程（系统/极简列表共用）
+ * 连接流程
  * ============================================================ */
 async function connectSelected() {
   if (!pendingDevice) { toast('请先搜索并选择设备', true); return; }
@@ -238,7 +178,7 @@ async function establishConnection(dev) {
     $('svcTree').innerHTML = `<div class="placeholder err">连接/读取服务失败：${esc(err.message)}</div>`;
     appendLog('err', '连接/读取服务失败：' + err.message);
     if (/not allowed to access/i.test(err.message)) {
-      appendLog('sys', '提示：请在「服务 UUID 过滤」填入设备的主服务 UUID 后重新搜索连接；或用「极简列表」模式（会自动从广播包带上服务授权）。');
+      appendLog('sys', '提示：请在「服务 UUID 过滤」填入设备的主服务 UUID 后重新搜索连接。');
     }
     throw err;
   }
@@ -352,31 +292,155 @@ async function doWrite(uuid, btn, noResp) {
 }
 
 /* ============================================================
+ * 主题（深色/浅色）
+ * ============================================================ */
+function applyTheme(t, save = true) {
+  const theme = t === 'light' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = theme;
+  if (save) { try { localStorage.setItem('ble_theme', theme); } catch {} }
+  document.querySelectorAll('.theme-btn').forEach((b) => {
+    b.textContent = theme === 'light' ? '🌙' : '☀️';
+  });
+}
+
+/* ============================================================
  * 页签 / 搜索模式
  * ============================================================ */
 function switchTab(name) {
+  // 非管理员禁止进入用户页（按钮已隐藏，此处为兜底）
+  if (name === 'mbuser' && !auth.isAdmin()) { toast('仅管理员可访问', true); return; }
   document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === name));
   document.querySelectorAll('.tab-body').forEach((b) => b.classList.toggle('active', b.id === 'tab-' + name));
+  if (name === 'mbuser') userPanel.render();
 }
 
-function syncSearchModeUI() {
-  document.querySelectorAll('#searchMode .seg-btn').forEach((b) => b.classList.toggle('active', b.dataset.mode === searchMode));
+/* ============================================================
+ * 用户认证与权限
+ * ============================================================ */
+// 普通用户仅可见「设备」页 + 顶部连接区；管理员可见全部页签
+const ADMIN_TABS = ['gatt', 'uart', 'modbus', 'proto'];
+// 无 Web Bluetooth 的浏览器也能登录做用户/设备管理，只隐藏依赖实时蓝牙的页签
+let bleOk = true;
+
+async function applyAuthUI() {
+  const u = auth.current();
+  const isAdmin = auth.isAdmin();
+  $('loginGate').classList.add('hidden');
+  $('userBox').classList.remove('hidden');
+  $('userBadge').textContent = `${u.username}（${isAdmin ? '管理员' : '普通用户'}）`;
+  // 页签栏随登录显示，不再依赖蓝牙连接
+  $('tabs').classList.remove('hidden');
+  for (const t of ADMIN_TABS) {
+    document.querySelector(`[data-tab="${t}"]`)?.classList.toggle('hidden', !isAdmin || !bleOk);
+  }
+  $('tabBtnUser').classList.toggle('hidden', !isAdmin);
+  mbDevicePanel.setReadOnly(!isAdmin);
+  // 若当前页签已被隐藏，切到设备页
+  const active = document.querySelector('.tab.active');
+  if (active && active.classList.contains('hidden')) switchTab('mbdev');
+  if (isAdmin) {
+    try { await auth.refreshUsers(); } catch {}
+    userPanel.render();
+  }
 }
 
-// 记住用户选择的搜索模式：避免每次刷新都重置成「系统列表」，
-// 换了支持/不支持实验接口的浏览器也能自动纠正（扫描时还会再校验一次）
-function saveSearchMode() { saveText(KEYS.SEARCH_MODE, searchMode); }
-function loadSearchMode() {
-  const m = loadText(KEYS.SEARCH_MODE);
-  if (m === 'system' || m === 'mini') searchMode = m;
-  syncSearchModeUI();
+function showGate(mode) {
+  $('loginGate').classList.remove('hidden');
+  $('userBox').classList.add('hidden');
+  $('loginForm').classList.toggle('hidden', mode !== 'login');
+  $('setupForm').classList.toggle('hidden', mode !== 'setup');
+  $('loginTitle').textContent = mode === 'setup' ? '创建管理员' : '登录';
+  $('loginHint').textContent = '';
+}
+
+async function afterLogin(welcome) {
+  applyAuthUI();
+  await mbDevicePanel.load();
+  await maybeMigrateLocal();
+  if (welcome) toast(welcome);
+}
+
+async function doLogin() {
+  try {
+    const u = await auth.verify($('loginUser').value, $('loginPw').value);
+    $('loginHint').textContent = '';
+    await afterLogin(`欢迎，${u.username}`);
+  } catch (err) {
+    $('loginHint').textContent = err.message;
+  }
+}
+
+async function doSetup() {
+  const a = $('setupUser').value, b = $('setupPw').value, c = $('setupPw2').value;
+  if (b !== c) { toast('两次密码不一致', true); return; }
+  try {
+    await auth.setupAdmin(a, b);
+    await afterLogin('管理员已创建，欢迎使用');
+  } catch (err) { toast(err.message, true); }
+}
+
+/** 一次性迁移：旧版 localStorage 设备配置导入 D1（仅管理员、仅服务端为空时） */
+async function maybeMigrateLocal() {
+  if (!auth.isAdmin()) return;
+  let local = null;
+  try { local = JSON.parse(localStorage.getItem('ble_mb_devices') || '[]'); } catch {}
+  if (!Array.isArray(local) || !local.length) return;
+  if (mbStore.devices.length) return;
+  let n = 0;
+  for (const d of local) {
+    try {
+      const nd = await mbStore.addDevice({
+        name: d.name, bleName: d.bleName || '',
+        slave: d.slave, wordOrder: d.wordOrder || 'ABCD',
+      });
+      for (const r of (d.registers || [])) {
+        try {
+          // 兼容旧版类型：holding→读写，input→只读
+          const rt = r.regType === 'holding' ? 'readwrite'
+            : r.regType === 'input' ? 'readonly' : r.regType;
+          await mbStore.addRegister(nd.id, {
+            name: r.name, address: r.address, regType: rt,
+            dataType: r.dataType, unit: r.unit || '',
+            scale: r.scale ?? 1, offset: r.offset ?? 0,
+          });
+        } catch {}
+      }
+      n++;
+    } catch {}
+  }
+  try {
+    localStorage.removeItem('ble_mb_devices');
+    localStorage.removeItem('ble_users');
+  } catch {}
+  if (n) {
+    appendLog('sys', `已将 ${n} 个本地设备配置迁移到云端`);
+    await mbDevicePanel.load();
+  }
+}
+
+function wireAuth() {
+  $('btnLogin').addEventListener('click', doLogin);
+  $('btnSetup').addEventListener('click', doSetup);
+  $('loginPw').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
+  $('btnLogout').addEventListener('click', () => {
+    auth.logout();
+    $('loginUser').value = '';
+    $('loginPw').value = '';
+    $('tabs').classList.add('hidden');
+    showGate('login');
+    toast('已退出登录');
+  });
+  $('btnNuAdd').addEventListener('click', () => userPanel.addUser());
+  $('userList').addEventListener('click', (e) => userPanel.onListClick(e));
+  document.querySelector('[data-tab="mbuser"]').addEventListener('click', () => userPanel.render());
 }
 
 /* ============================================================
  * 初始化
  * ============================================================ */
-function init() {
-  if (!detectSupport()) return;
+async function init() {
+  // 无 Web Bluetooth 的浏览器也能登录做用户/设备管理，不提前 return
+  bleOk = detectSupport();
 
   // 连接卡片
   $('btnScan').addEventListener('click', searchDevice);
@@ -401,8 +465,55 @@ function init() {
   });
 
   // UART 面板
-  $('btnSaveUart').addEventListener('click', () => uartPanel.save());
+  // 透传页保存 → 写入当前选中设备的透传配置（D1，随设备走）
+  $('btnSaveUart').addEventListener('click', async () => {
+    const dev = mbDevicePanel.curDevice();
+    if (!dev) { toast('请先在「设备」页选择设备', true); return; }
+    const uart = uartPanel.readInputs();
+    try {
+      await mbStore.updateDevice(dev.id, { uart });
+      uartPanel.applyConfig(uart);
+      uartPanel.autoSubscribeRx();
+      toast(`透传配置已保存到「${dev.name}」`);
+      appendLog('sys', `透传配置已保存到设备「${dev.name}」`);
+    } catch (err) { toast(err.message, true); }
+  });
   $('btnSend').addEventListener('click', () => uartPanel.send());
+
+  // Modbus RTU
+  $('btnMbSend').addEventListener('click', () => modbusPanel.execute());
+  $('btnMbClear').addEventListener('click', () => { $('mbResult').innerHTML = ''; });
+  $('mbFunc').addEventListener('change', () => { modbusPanel.syncFuncUI(); modbusPanel.saveCfg(); });
+  $('mbFmt').addEventListener('change', () => { modbusPanel.syncOrderUI(); modbusPanel.saveCfg(); });
+  $('mbOrder').addEventListener('change', () => modbusPanel.saveCfg());
+  $('mbAddr').addEventListener('change', () => modbusPanel.saveCfg());
+
+  // Modbus 设备配置
+  $('mbdSel').addEventListener('change', (e) => mbDevicePanel.selectDevice(e.target.value));
+  $('btnMbdAdd').addEventListener('click', () => mbDevicePanel.showDeviceForm('new'));
+  $('btnMbdEdit').addEventListener('click', () => {
+    if (mbDevicePanel.curDevice()) mbDevicePanel.showDeviceForm(mbDevicePanel.curDeviceId);
+    else toast('先新增设备', true);
+  });
+  $('btnMbdDel').addEventListener('click', () => mbDevicePanel.deleteDevice());
+  $('btnMbdSave').addEventListener('click', () => mbDevicePanel.saveDeviceForm());
+  $('btnMbdCancel').addEventListener('click', () => mbDevicePanel.hideForms());
+  $('btnMbrAdd').addEventListener('click', () => mbDevicePanel.showRegForm('new'));
+  $('btnMbrSave').addEventListener('click', () => mbDevicePanel.saveRegForm());
+  $('btnMbrCancel').addEventListener('click', () => mbDevicePanel.hideForms());
+  // 选择"选择"类型时显示选项输入行
+  $('mbrDataType').addEventListener('change', (e) => {
+    const isEnum = e.target.value === 'enum';
+    $('mbrOptionsWrap').classList.toggle('hidden', !isEnum);
+    $('mbrReadOptionsWrap').classList.toggle('hidden', !isEnum);
+  });
+  $('btnMbrOptAdd').addEventListener('click', () => mbDevicePanel.addOptRow('mbrOptList'));
+  $('btnMbrReadOptAdd').addEventListener('click', () => mbDevicePanel.addOptRow('mbrReadOptList'));
+  $('mbrOptList').addEventListener('click', (e) => mbDevicePanel.onOptListClick(e));
+  $('mbrReadOptList').addEventListener('click', (e) => mbDevicePanel.onOptListClick(e));
+  $('btnMbrReadAll').addEventListener('click', () => mbDevicePanel.readAll());
+  $('mbrList').addEventListener('click', (e) => mbDevicePanel.onListClick(e));
+  $('mbrList').addEventListener('pointerdown', (e) => mbDevicePanel.onDragPointerDown(e));
   $('btnClearUartRx').addEventListener('click', () => { $('uartRx').textContent = ''; });
   $('sendMode').addEventListener('click', (e) => {
     const b = e.target.closest('.seg-btn'); if (!b) return;
@@ -432,23 +543,28 @@ function init() {
   $('btnProtoLoad').addEventListener('click', () => protocolPanel.loadFromInput());
   $('byteView').addEventListener('click', (e) => protocolPanel.handleByteClick(e));
 
-  // 搜索模式切换
-  $('searchMode').addEventListener('click', (e) => {
-    const b = e.target.closest('.seg-btn'); if (!b) return;
-    searchMode = b.dataset.mode;
-    syncSearchModeUI();
-    saveSearchMode();
-    $('miniList').classList.add('hidden');
-    toast(searchMode === 'mini' ? '已切换极简列表：点「搜索设备」在页面内扫描' : '已切换系统列表', false);
-  });
-
   // 页签
   document.querySelectorAll('.tab').forEach((t) => t.addEventListener('click', () => switchTab(t.dataset.tab)));
+
+  // 主题切换
+  applyTheme(document.documentElement.dataset.theme || 'dark', false);
+  document.querySelectorAll('.theme-btn').forEach((b) => b.addEventListener('click', () => {
+    applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
+  }));
+
+  // 用户认证（服务端）
+  wireAuth();
+  try { await auth.load(); } catch { /* 连不上服务端则走登录门 */ }
 
   // 载入持久化配置
   uartPanel.load();
   protocolPanel.load();
-  loadSearchMode();
+  modbusPanel.load();
+
+  // 登录门禁：无用户则引导创建管理员，未登录则显示登录框
+  if (!auth.hasUsers()) showGate('setup');
+  else if (!auth.current()) showGate('login');
+  else await afterLogin();
 
   setConnUI(false);
   setPill('', '未连接');

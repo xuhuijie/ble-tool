@@ -113,10 +113,8 @@ export function setPill(state, text) {
 
 export function setConnUI(connected) {
   $('deviceSection').classList.toggle('hidden', !connected);
-  $('tabs').classList.toggle('hidden', !connected);
   $('connectCard').classList.toggle('hidden', connected);
-  // 未连接时隐藏全部页签内容（tab-gatt 默认带 active，否则会显示空的 GATT 卡片）
-  document.querySelectorAll('.tab-body').forEach((b) => b.classList.toggle('hidden', !connected));
+  // 注意：页签栏不再跟随蓝牙连接状态，登录后即显示（用户管理无需连接设备）
 }
 
 /* ---------- GATT 服务树渲染 ----------

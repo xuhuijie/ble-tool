@@ -22,10 +22,32 @@ export class UartPanel {
   /** 从 localStorage 载入配置并回填输入框 */
   load() {
     this.cfg = { ...DEFAULT_CFG, ...loadJson(KEYS.UART, {}) };
+    this.fillInputs();
+  }
+
+  /** 回填透传页输入框 */
+  fillInputs() {
     $('uartTxSvc').value = this.cfg.txService;
     $('uartTxChar').value = this.cfg.txChar;
     $('uartRxSvc').value = this.cfg.rxService;
     $('uartRxChar').value = this.cfg.rxChar;
+  }
+
+  /** 应用设备绑定的透传配置（切换设备时调用） */
+  applyConfig(uart) {
+    this.cfg = {
+      txService: uart?.txSvc || '', txChar: uart?.txChar || '',
+      rxService: uart?.rxSvc || '', rxChar: uart?.rxChar || '',
+    };
+    this.fillInputs();
+  }
+
+  /** 读取透传页输入框的当前配置 */
+  readInputs() {
+    return {
+      txSvc: $('uartTxSvc').value.trim(), txChar: $('uartTxChar').value.trim(),
+      rxSvc: $('uartRxSvc').value.trim(), rxChar: $('uartRxChar').value.trim(),
+    };
   }
 
   /** 保存配置并立即生效（自动订阅 RX） */
