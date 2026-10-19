@@ -12,3 +12,8 @@ config.local.json
 # IDE / 编辑器
 .vscode/
 .idea/
+# Wrangler 本地状态（部署时自动生成，勿提交）
+.wrangler/
+
+# 构建产物：public/ 由部署前 cp index.html/js/css 自动生成，勿提交
+public/

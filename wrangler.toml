@@ -1,0 +1,16 @@
+# Cloudflare Workers 部署配置：静态资源 + /api/* 用户与设备配置接口
+name = "ble-rtu-web"
+main = "worker/worker.js"
+compatibility_date = "2026-10-16"
+
+[assets]
+directory = "./public"
+not_found_handling = "single-page-application"
+
+# D1 数据库：用户 / 设备 / 寄存器配置
+[[d1_databases]]
+binding = "DB"
+database_name = "ble-tool-db"
+database_id = "7301c594-249a-4486-8066-30172141a861"
+
+# AUTH_SECRET 通过 `wrangler secret put AUTH_SECRET` 设置，不进版本库
